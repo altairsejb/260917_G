@@ -4,7 +4,10 @@ from datetime import datetime
 from flask import Flask, render_template, request, jsonify, g
 
 app = Flask(__name__)
-app.config['DATABASE'] = os.path.join(os.path.dirname(__file__), 'todos.db')
+if os.environ.get('VERCEL'):
+    app.config['DATABASE'] = '/tmp/todos.db'
+else:
+    app.config['DATABASE'] = os.path.join(os.path.dirname(__file__), 'todos.db')
 app.config['JSON_AS_ASCII'] = False
 
 def get_db():
@@ -263,7 +266,8 @@ def get_stats():
         'priorities': priorities
     })
 
+with app.app_context():
+    init_db()
+
 if __name__ == '__main__':
-    with app.app_context():
-        init_db()
     app.run(host='0.0.0.0', port=5000, debug=True)
