@@ -1,26 +1,29 @@
 import unittest
 import os
 import json
-import tempfile
 import sys
 
 # Ensure my_webapp directory is on sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from app import app, init_db
+# DATABASE_URL must point at a Supabase/Postgres instance before app import
+from app import app, init_db, get_db, execute
 
 class TaskFlowTestCase(unittest.TestCase):
     def setUp(self):
-        self.db_fd, self.db_path = tempfile.mkstemp()
-        app.config['DATABASE'] = self.db_path
         app.config['TESTING'] = True
         self.client = app.test_client()
 
         with app.app_context():
+            db = get_db()
+            execute(db, 'TRUNCATE TABLE todos RESTART IDENTITY')
+            db.commit()
             init_db()
 
     def tearDown(self):
-        os.close(self.db_fd)
-        os.unlink(self.db_path)
+        with app.app_context():
+            db = get_db()
+            execute(db, 'TRUNCATE TABLE todos RESTART IDENTITY')
+            db.commit()
 
     def test_health_check(self):
         """서버 헬스 체크 엔드포인트 테스트"""

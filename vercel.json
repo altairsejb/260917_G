@@ -8,8 +8,5 @@
   ],
   "routes": [
     { "src": "/(.*)", "dest": "app.py" }
-  ],
-  "env": {
-    "VERCEL": "1"
-  }
+  ]
 }

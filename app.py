@@ -1,20 +1,22 @@
 import os
-import sqlite3
 from datetime import datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template, request, jsonify, g
 
 app = Flask(__name__)
-if os.environ.get('VERCEL'):
-    app.config['DATABASE'] = '/tmp/todos.db'
-else:
-    app.config['DATABASE'] = os.path.join(os.path.dirname(__file__), 'todos.db')
+app.config['DATABASE_URL'] = os.environ['DATABASE_URL']
 app.config['JSON_AS_ASCII'] = False
 
 def get_db():
     if 'db' not in g:
-        g.db = sqlite3.connect(app.config['DATABASE'])
-        g.db.row_factory = sqlite3.Row
+        g.db = psycopg2.connect(app.config['DATABASE_URL'], cursor_factory=RealDictCursor)
     return g.db
+
+def execute(db, sql, params=None):
+    cur = db.cursor()
+    cur.execute(sql, params or [])
+    return cur
 
 @app.teardown_appcontext
 def close_db(error):
@@ -24,9 +26,9 @@ def close_db(error):
 
 def init_db():
     db = get_db()
-    db.execute('''
+    execute(db, '''
         CREATE TABLE IF NOT EXISTS todos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             title TEXT NOT NULL,
             description TEXT,
             category TEXT DEFAULT '일반',
@@ -40,18 +42,18 @@ def init_db():
     db.commit()
 
     # 초기 샘플 데이터가 없으면 예시 데이터 삽입
-    cursor = db.execute('SELECT COUNT(*) as count FROM todos')
+    cursor = execute(db, 'SELECT COUNT(*) as count FROM todos')
     if cursor.fetchone()['count'] == 0:
         sample_todos = [
-            ('Flask 웹 애플리케이션 구조 설계', 'REST API와 SQLite 데이터베이스 스키마 완성하기', '업무', 'high', '2026-09-17', 1),
+            ('Flask 웹 애플리케이션 구조 설계', 'REST API와 Supabase(Postgres) 데이터베이스 스키마 완성하기', '업무', 'high', '2026-09-17', 1),
             ('할일 관리 UI/UX 디자인 개선', '모던 글래스모피즘 및 다크/라이트 테마 적용', '업무', 'high', '2026-09-18', 0),
             ('Python 백엔드 연동 테스트', 'CRUD API 및 단위 테스트 코드 작성 및 실행', '공부', 'medium', '2026-09-19', 0),
             ('가벼운 운동 및 산책하기', '하루 30분 유산소 운동으로 건강 챙기기', '건강', 'low', '2026-09-20', 0),
             ('주간 회의 자료 준비', '다음 주 진행될 프로젝트 스프린트 계획 수립', '개인', 'medium', '2026-09-22', 0),
         ]
-        db.executemany('''
+        db.cursor().executemany('''
             INSERT INTO todos (title, description, category, priority, due_date, completed)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         ''', sample_todos)
         db.commit()
 
@@ -88,22 +90,22 @@ def get_todos():
         query += ' AND completed = 1'
 
     if category and category != 'all':
-        query += ' AND category = ?'
+        query += ' AND category = %s'
         params.append(category)
 
     if priority and priority != 'all':
-        query += ' AND priority = ?'
+        query += ' AND priority = %s'
         params.append(priority)
 
     if search:
-        query += ' AND (title LIKE ? OR description LIKE ?)'
+        query += ' AND (title LIKE %s OR description LIKE %s)'
         params.extend([f'%{search}%', f'%{search}%'])
 
     # 정렬 기준
     allowed_sort_fields = {
         'created_at': 'created_at',
-        'due_date': 'CASE WHEN due_date IS NULL OR due_date = "" THEN 1 ELSE 0 END, due_date',
-        'priority': 'CASE priority WHEN "high" THEN 1 WHEN "medium" THEN 2 WHEN "low" THEN 3 ELSE 4 END',
+        'due_date': "CASE WHEN due_date IS NULL OR due_date = '' THEN 1 ELSE 0 END, due_date",
+        'priority': "CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END",
         'title': 'title'
     }
     sort_sql = allowed_sort_fields.get(sort_by, 'created_at')
@@ -113,7 +115,7 @@ def get_todos():
     query += f' ORDER BY completed ASC, {sort_sql} {order_sql}'
 
     db = get_db()
-    cursor = db.execute(query, params)
+    cursor = execute(db, query, params)
     todos = [dict(row) for row in cursor.fetchall()]
     return jsonify(todos)
 
@@ -121,7 +123,7 @@ def get_todos():
 @app.route('/api/todos/<int:todo_id>', methods=['GET'])
 def get_todo(todo_id):
     db = get_db()
-    cursor = db.execute('SELECT * FROM todos WHERE id = ?', (todo_id,))
+    cursor = execute(db, 'SELECT * FROM todos WHERE id = %s', (todo_id,))
     row = cursor.fetchone()
     if row is None:
         return jsonify({'error': 'Todo not found'}), 404
@@ -143,14 +145,15 @@ def add_todo():
     due_date = data.get('due_date', '').strip()
 
     db = get_db()
-    cursor = db.execute('''
+    cursor = execute(db, '''
         INSERT INTO todos (title, description, category, priority, due_date, completed)
-        VALUES (?, ?, ?, ?, ?, 0)
+        VALUES (%s, %s, %s, %s, %s, 0)
+        RETURNING id
     ''', (title, description, category, priority, due_date))
+    new_id = cursor.fetchone()['id']
     db.commit()
 
-    new_id = cursor.lastrowid
-    new_todo = db.execute('SELECT * FROM todos WHERE id = ?', (new_id,)).fetchone()
+    new_todo = execute(db, 'SELECT * FROM todos WHERE id = %s', (new_id,)).fetchone()
     return jsonify(dict(new_todo)), 201
 
 # Todo 수정 API
@@ -158,7 +161,7 @@ def add_todo():
 def update_todo(todo_id):
     data = request.get_json() or {}
     db = get_db()
-    todo = db.execute('SELECT * FROM todos WHERE id = ?', (todo_id,)).fetchone()
+    todo = execute(db, 'SELECT * FROM todos WHERE id = %s', (todo_id,)).fetchone()
     if not todo:
         return jsonify({'error': 'Todo not found'}), 404
 
@@ -172,40 +175,40 @@ def update_todo(todo_id):
     due_date = data.get('due_date', todo['due_date'])
     completed = 1 if data.get('completed', todo['completed']) else 0
 
-    db.execute('''
+    execute(db, '''
         UPDATE todos
-        SET title = ?, description = ?, category = ?, priority = ?, due_date = ?, completed = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        SET title = %s, description = %s, category = %s, priority = %s, due_date = %s, completed = %s, updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
     ''', (title, description, category, priority, due_date, completed, todo_id))
     db.commit()
 
-    updated = db.execute('SELECT * FROM todos WHERE id = ?', (todo_id,)).fetchone()
+    updated = execute(db, 'SELECT * FROM todos WHERE id = %s', (todo_id,)).fetchone()
     return jsonify(dict(updated))
 
 # Todo 완료 상태 토글 API
 @app.route('/api/todos/<int:todo_id>/toggle', methods=['PATCH'])
 def toggle_todo(todo_id):
     db = get_db()
-    todo = db.execute('SELECT * FROM todos WHERE id = ?', (todo_id,)).fetchone()
+    todo = execute(db, 'SELECT * FROM todos WHERE id = %s', (todo_id,)).fetchone()
     if not todo:
         return jsonify({'error': 'Todo not found'}), 404
 
     new_status = 0 if todo['completed'] == 1 else 1
-    db.execute('''
+    execute(db, '''
         UPDATE todos
-        SET completed = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        SET completed = %s, updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
     ''', (new_status, todo_id))
     db.commit()
 
-    updated = db.execute('SELECT * FROM todos WHERE id = ?', (todo_id,)).fetchone()
+    updated = execute(db, 'SELECT * FROM todos WHERE id = %s', (todo_id,)).fetchone()
     return jsonify(dict(updated))
 
 # Todo 삭제 API
 @app.route('/api/todos/<int:todo_id>', methods=['DELETE'])
 def delete_todo(todo_id):
     db = get_db()
-    cursor = db.execute('DELETE FROM todos WHERE id = ?', (todo_id,))
+    cursor = execute(db, 'DELETE FROM todos WHERE id = %s', (todo_id,))
     db.commit()
     if cursor.rowcount == 0:
         return jsonify({'error': 'Todo not found'}), 404
@@ -215,7 +218,7 @@ def delete_todo(todo_id):
 @app.route('/api/todos/completed', methods=['DELETE'])
 def delete_completed_todos():
     db = get_db()
-    cursor = db.execute('DELETE FROM todos WHERE completed = 1')
+    cursor = execute(db, 'DELETE FROM todos WHERE completed = 1')
     db.commit()
     return jsonify({'success': True, 'deleted_count': cursor.rowcount})
 
@@ -223,13 +226,13 @@ def delete_completed_todos():
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     db = get_db()
-    total = db.execute('SELECT COUNT(*) as count FROM todos').fetchone()['count']
-    completed = db.execute('SELECT COUNT(*) as count FROM todos WHERE completed = 1').fetchone()['count']
+    total = execute(db, 'SELECT COUNT(*) as count FROM todos').fetchone()['count']
+    completed = execute(db, 'SELECT COUNT(*) as count FROM todos WHERE completed = 1').fetchone()['count']
     pending = total - completed
     rate = round((completed / total * 100), 1) if total > 0 else 0
 
     # 카테고리별 통계
-    cat_cursor = db.execute('''
+    cat_cursor = execute(db, '''
         SELECT category, COUNT(*) as count, SUM(completed) as completed_count
         FROM todos
         GROUP BY category
@@ -244,7 +247,7 @@ def get_stats():
     ]
 
     # 우선순위별 통계
-    priority_cursor = db.execute('''
+    priority_cursor = execute(db, '''
         SELECT priority, COUNT(*) as count, SUM(completed) as completed_count
         FROM todos
         GROUP BY priority
