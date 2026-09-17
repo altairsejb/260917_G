@@ -1,119 +1,95 @@
 import unittest
 import os
-import json
 import sys
 
 # Ensure my_webapp directory is on sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-# DATABASE_URL must point at a Supabase/Postgres instance before app import
+# DATABASE_URL must point at a Supabase/Postgres instance before app import.
+# MOLIT_API_KEY is intentionally left unset so tests run against the
+# deterministic mock data path (no network dependency on the MOLIT API).
+os.environ.pop('MOLIT_API_KEY', None)
+
 from app import app, init_db, get_db, execute
 
-class TaskFlowTestCase(unittest.TestCase):
+GANGNAM_LAWD_CD = '11680'
+
+
+class ApartmentPriceTestCase(unittest.TestCase):
     def setUp(self):
         app.config['TESTING'] = True
         self.client = app.test_client()
 
         with app.app_context():
             db = get_db()
-            execute(db, 'TRUNCATE TABLE todos RESTART IDENTITY')
+            execute(db, 'TRUNCATE TABLE apartment_trades RESTART IDENTITY')
             db.commit()
             init_db()
 
     def tearDown(self):
         with app.app_context():
             db = get_db()
-            execute(db, 'TRUNCATE TABLE todos RESTART IDENTITY')
+            execute(db, 'TRUNCATE TABLE apartment_trades RESTART IDENTITY')
             db.commit()
 
     def test_health_check(self):
-        """서버 헬스 체크 엔드포인트 테스트"""
         response = self.client.get('/api/health')
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(data['status'], 'ok')
+        self.assertFalse(data['molit_api_configured'])
 
     def test_index_page(self):
-        """메인 웹페이지 렌더링 테스트"""
         response = self.client.get('/')
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b'TaskFlow', response.data)
+        self.assertIn('아파트'.encode('utf-8'), response.data)
 
-    def test_create_and_get_todo(self):
-        """할일 생성 및 조회 테스트"""
-        new_todo = {
-            'title': '새로운 테스트 할일',
-            'description': '테스트 설명 내용',
-            'category': '업무',
-            'priority': 'high',
-            'due_date': '2026-09-30'
-        }
-        res = self.client.post('/api/todos', json=new_todo)
-        self.assertEqual(res.status_code, 201)
-        created = res.get_json()
-        self.assertEqual(created['title'], '새로운 테스트 할일')
-        self.assertEqual(created['completed'], 0)
+    def test_regions_endpoint(self):
+        response = self.client.get('/api/regions')
+        self.assertEqual(response.status_code, 200)
+        regions = response.get_json()
+        self.assertEqual(len(regions), 25)
+        self.assertIn('11680', [r['code'] for r in regions])
 
-        # 목록에서 조회되는지 확인
-        list_res = self.client.get('/api/todos')
-        self.assertEqual(list_res.status_code, 200)
-        todos = list_res.get_json()
-        self.assertTrue(any(t['id'] == created['id'] for t in todos))
+    def test_trades_requires_params(self):
+        response = self.client.get('/api/trades')
+        self.assertEqual(response.status_code, 400)
 
-    def test_toggle_todo(self):
-        """할일 완료 상태 토글 테스트"""
-        # 생성
-        res = self.client.post('/api/todos', json={'title': '토글 테스트'})
-        todo_id = res.get_json()['id']
+    def test_trades_returns_mock_data(self):
+        response = self.client.get(f'/api/trades?lawd_cd={GANGNAM_LAWD_CD}&deal_ymd=202508')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data['source'], 'mock')
+        self.assertGreater(data['count'], 0)
+        item = data['items'][0]
+        self.assertIn('price_per_pyeong', item)
+        self.assertGreater(item['price_per_pyeong'], 0)
 
-        # 토글 -> 완료
-        toggle_res = self.client.patch(f'/api/todos/{todo_id}/toggle')
-        self.assertEqual(toggle_res.status_code, 200)
-        self.assertEqual(toggle_res.get_json()['completed'], 1)
+    def test_trades_are_cached(self):
+        first = self.client.get(f'/api/trades?lawd_cd={GANGNAM_LAWD_CD}&deal_ymd=202508').get_json()
+        second = self.client.get(f'/api/trades?lawd_cd={GANGNAM_LAWD_CD}&deal_ymd=202508').get_json()
+        self.assertEqual(first['count'], second['count'])
+        self.assertEqual(
+            sorted(i['apt_name'] for i in first['items']),
+            sorted(i['apt_name'] for i in second['items']),
+        )
 
-        # 다시 토글 -> 진행중
-        toggle_res2 = self.client.patch(f'/api/todos/{todo_id}/toggle')
-        self.assertEqual(toggle_res2.status_code, 200)
-        self.assertEqual(toggle_res2.get_json()['completed'], 0)
+    def test_analysis_requires_lawd_cd(self):
+        response = self.client.get('/api/analysis')
+        self.assertEqual(response.status_code, 400)
 
-    def test_update_todo(self):
-        """할일 정보 수정 테스트"""
-        res = self.client.post('/api/todos', json={'title': '수정 전 제목', 'priority': 'low'})
-        todo_id = res.get_json()['id']
+    def test_analysis_returns_estimate(self):
+        response = self.client.get(f'/api/analysis?lawd_cd={GANGNAM_LAWD_CD}&months=3&premium_rate=0.05')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data['source'], 'mock')
+        self.assertEqual(len(data['monthly']), 3)
+        self.assertGreater(data['sample_count'], 0)
+        self.assertIsNotNone(data['estimate'])
+        self.assertGreater(
+            data['estimate']['estimated_new_presale_price_per_pyeong'],
+            data['estimate']['recent_avg_price_per_pyeong'],
+        )
 
-        update_payload = {
-            'title': '수정 완료된 제목',
-            'priority': 'high',
-            'category': '공부',
-            'description': '수정된 메모'
-        }
-        update_res = self.client.put(f'/api/todos/{todo_id}', json=update_payload)
-        self.assertEqual(update_res.status_code, 200)
-        updated = update_res.get_json()
-        self.assertEqual(updated['title'], '수정 완료된 제목')
-        self.assertEqual(updated['priority'], 'high')
-        self.assertEqual(updated['category'], '공부')
-
-    def test_delete_todo(self):
-        """할일 삭제 테스트"""
-        res = self.client.post('/api/todos', json={'title': '삭제될 할일'})
-        todo_id = res.get_json()['id']
-
-        del_res = self.client.delete(f'/api/todos/{todo_id}')
-        self.assertEqual(del_res.status_code, 200)
-
-        # 조회 시 404 확인
-        get_res = self.client.get(f'/api/todos/{todo_id}')
-        self.assertEqual(get_res.status_code, 404)
-
-    def test_stats_endpoint(self):
-        """통계 API 정상 집계 테스트"""
-        res = self.client.get('/api/stats')
-        self.assertEqual(res.status_code, 200)
-        stats = res.get_json()
-        self.assertIn('total', stats)
-        self.assertIn('completed', stats)
-        self.assertIn('pending', stats)
-        self.assertIn('completion_rate', stats)
 
 if __name__ == '__main__':
     unittest.main()
