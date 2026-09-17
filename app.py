@@ -1,6 +1,7 @@
 import os
 import random
 import statistics
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from xml.etree import ElementTree
 
@@ -107,9 +108,9 @@ def fetch_from_molit(lawd_cd, deal_ymd):
     if '%' in MOLIT_API_KEY:
         # 이미 URL 인코딩된 서비스키인 경우 이중 인코딩을 피하기 위해 직접 쿼리스트링을 구성
         qs = '&'.join(f'{k}={v}' for k, v in params.items())
-        resp = requests.get(f'{MOLIT_BASE_URL}?serviceKey={MOLIT_API_KEY}&{qs}', timeout=10)
+        resp = requests.get(f'{MOLIT_BASE_URL}?serviceKey={MOLIT_API_KEY}&{qs}', timeout=8)
     else:
-        resp = requests.get(MOLIT_BASE_URL, params={**params, 'serviceKey': MOLIT_API_KEY}, timeout=10)
+        resp = requests.get(MOLIT_BASE_URL, params={**params, 'serviceKey': MOLIT_API_KEY}, timeout=8)
     resp.raise_for_status()
 
     root = ElementTree.fromstring(resp.content)
@@ -171,18 +172,10 @@ def generate_mock_trades(lawd_cd, deal_ymd):
     return items
 
 
-def get_trades(lawd_cd, deal_ymd):
-    """캐시(Supabase) 우선 조회 -> 없으면 국토부 API(또는 목업) 호출 후 캐싱."""
-    db = get_db()
-    cached = execute(db, '''
-        SELECT * FROM apartment_trades WHERE lawd_cd = %s AND deal_ymd = %s
-    ''', (lawd_cd, deal_ymd)).fetchall()
-    if cached:
-        source = cached[0]['source']
-        return [dict(row) for row in cached], source
-
-    source = 'mock'
+def fetch_month_items(lawd_cd, deal_ymd):
+    """국토부 API(또는 목업)에서 한 달치 데이터를 가져온다. DB에 접근하지 않아 스레드에서 안전하게 호출 가능."""
     items = []
+    source = 'mock'
     if MOLIT_API_KEY:
         try:
             items = fetch_from_molit(lawd_cd, deal_ymd)
@@ -192,7 +185,10 @@ def get_trades(lawd_cd, deal_ymd):
     if not items:
         items = generate_mock_trades(lawd_cd, deal_ymd)
         source = 'mock'
+    return items, source
 
+
+def store_trades(db, lawd_cd, deal_ymd, items, source):
     cur = db.cursor()
     for it in items:
         cur.execute('''
@@ -204,12 +200,60 @@ def get_trades(lawd_cd, deal_ymd):
         ''', (lawd_cd, deal_ymd, it['umd_nm'], it['apt_name'], it['exclusive_area'],
               it['deal_amount'], it['deal_year'], it['deal_month'], it['deal_day'],
               it['floor'], it['build_year'], source))
+
+
+def get_trades(lawd_cd, deal_ymd):
+    """캐시(Supabase) 우선 조회 -> 없으면 국토부 API(또는 목업) 호출 후 캐싱."""
+    db = get_db()
+    cached = execute(db, '''
+        SELECT * FROM apartment_trades WHERE lawd_cd = %s AND deal_ymd = %s
+    ''', (lawd_cd, deal_ymd)).fetchall()
+    if cached:
+        source = cached[0]['source']
+        return [dict(row) for row in cached], source
+
+    items, source = fetch_month_items(lawd_cd, deal_ymd)
+    store_trades(db, lawd_cd, deal_ymd, items, source)
     db.commit()
 
     rows = execute(db, '''
         SELECT * FROM apartment_trades WHERE lawd_cd = %s AND deal_ymd = %s
     ''', (lawd_cd, deal_ymd)).fetchall()
     return [dict(row) for row in rows], source
+
+
+def get_trades_bulk(lawd_cd, deal_ymd_list):
+    """여러 달치 데이터를 캐시 우선 조회하고, 없는 달은 국토부 API를 병렬 호출해 채운다."""
+    db = get_db()
+    cached = execute(db, '''
+        SELECT * FROM apartment_trades WHERE lawd_cd = %s AND deal_ymd = ANY(%s)
+    ''', (lawd_cd, deal_ymd_list)).fetchall()
+
+    by_ymd = {}
+    for row in cached:
+        by_ymd.setdefault(row['deal_ymd'], []).append(dict(row))
+    missing = [ymd for ymd in deal_ymd_list if ymd not in by_ymd]
+
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(len(missing), 8)) as pool:
+            future_to_ymd = {pool.submit(fetch_month_items, lawd_cd, ymd): ymd for ymd in missing}
+            fetched = {}
+            for future in as_completed(future_to_ymd):
+                ymd = future_to_ymd[future]
+                fetched[ymd] = future.result()
+
+        for ymd in missing:
+            items, source = fetched[ymd]
+            store_trades(db, lawd_cd, ymd, items, source)
+        db.commit()
+
+        rows = execute(db, '''
+            SELECT * FROM apartment_trades WHERE lawd_cd = %s AND deal_ymd = ANY(%s)
+        ''', (lawd_cd, missing)).fetchall()
+        for row in rows:
+            by_ymd.setdefault(row['deal_ymd'], []).append(dict(row))
+
+    return by_ymd
 
 
 def recent_year_months(months):
@@ -272,12 +316,14 @@ def analysis():
         return jsonify({'error': 'lawd_cd 파라미터가 필요합니다.'}), 400
 
     ym_list = recent_year_months(months)
+    trades_by_ymd = get_trades_bulk(lawd_cd, ym_list)
+
     monthly = []
     all_items = []
     overall_source = 'molit'
     for ymd in ym_list:
-        items, source = get_trades(lawd_cd, ymd)
-        if source == 'mock':
+        items = trades_by_ymd.get(ymd, [])
+        if items and items[0]['source'] == 'mock':
             overall_source = 'mock'
         prices = [price_per_pyeong(it['deal_amount'], float(it['exclusive_area'])) for it in items]
         all_items.extend(items)
